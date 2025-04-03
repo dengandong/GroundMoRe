@@ -1,7 +1,7 @@
-# GROUNDMORE: Motion-Grounded Video Reasoning
+# Motion-Grounded Video Reasoning: Understanding and Perceiving Motion at Pixel Level
 
 **[CVPR 2025]**  
-[[Project Page](https://groundmore.github.io)] [[Paper (PDF)](https://groundmore.github.io/assets/GroudMoRe_CVPR_Camera_Ready.pdf)]
+[[Project Page](https://groundmore.github.io)] [[Paper (PDF)](assets/GroundMoRe_CVPR2025_Camera_Ready.pdf)]
 
 <!-- ![GROUNDMORE Teaser](assets/teaser.png) -->
 
