@@ -149,8 +149,8 @@ python evaluate_groundmore.py
 
 ## ✅ TODO
 
-- [ ] Release **MoRA-ZS-LISA13B**
 - [ ] Release **MoRA-FT-LISA7B**
+- [ ] Release **MoRA-ZS-LISA13B**
 - [ ] Release **MoRA-FT-LISA13B**
 
 
