@@ -138,9 +138,6 @@ We use [Refer-YouTube-VOS](https://youtube-vos.org/dataset/vos/), [MeViS](https:
 bash run.sh
 ```
 
-### GroundMoRe Training Set Finetuning
-Coming soon.
-
 ### GroundMoRe Evaluation
 
 ```bash
