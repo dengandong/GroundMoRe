@@ -3,3 +3,6 @@ MoRA-ZA-7B/
 
 # Ignore specific script
 hf_upload.py
+
+__pycache__/
+*.py[cod]
