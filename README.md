@@ -123,19 +123,25 @@ pip install -r requirements.txt
 
 ## 🚀 Usage
 
-### Run Zero-Shot Evaluation
+### Training
+Before training, you need to obtain [LISA](https://huggingface.co/xinlai/LISA-7B-v1/tree/main) and [SAM](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth) for model initialization.
 
-```bash
-python scripts/evaluate.py --config configs/mora_zs.yaml
+### Zero-Shot Training
+We use [Refer-YouTube-VOS](https://youtube-vos.org/dataset/vos/), [MeViS](https://github.com/henghuiding/MeViS) dataset for zero-shot training.
+
+```
+bash run.sh
 ```
 
-### Fine-tune MoRA
+### GroundMoRe Training Set Finetuning
+Coming soon.
+
+### GroundMoRe Evaluation
 
 ```bash
-python scripts/train_mora.py --config configs/mora_ft.yaml
+python evaluate_groundmore.py
 ```
 
----
 
 ---
 
