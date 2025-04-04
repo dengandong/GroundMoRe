@@ -7,7 +7,7 @@ deepspeed --master_port=24999 --include=localhost:0,1 train_ds.py \
 --dataset="refer_video_seg" \
 --sample_rates="1" \
 --conv_type="llava_llama_2" \
---exp_name="lisa-7b-running" \
+--exp_name="mora-lisa7b-zs-training" \
 --log_base_dir="" \
 --steps_per_epoch 500 \
 --epochs 20 \
