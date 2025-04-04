@@ -131,6 +131,8 @@ https://huggingface.co/datasets/groundmore/GroundMoRe
 ### Training
 Before training, you need to obtain [LISA](https://huggingface.co/xinlai/LISA-7B-v1/tree/main) and [SAM](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth) for model initialization.
 
+Put SAM pretrained weights at ```./pretrain_weights/```
+
 ### Zero-Shot Training
 We use [Refer-YouTube-VOS](https://youtube-vos.org/dataset/vos/), [MeViS](https://github.com/henghuiding/MeViS) dataset for zero-shot training.
 
