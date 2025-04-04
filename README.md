@@ -116,6 +116,7 @@ cd GROUNDMORE
 conda create -n groundmore python=3.10
 conda activate groundmore
 pip install -r requirements.txt
+pip install flash-attn --no-build-isolation
 ```
 
 
@@ -145,9 +146,17 @@ Coming soon.
 ```bash
 python evaluate_groundmore.py
 ```
-
+---
 
 ---
+
+## ✅ TODO
+
+- [ ] Release **MoRA-ZS-LISA13B**
+- [ ] Release **MoRA-FT-LISA7B**
+- [ ] Release **MoRA-FT-LISA13B**
+
+
 
 ## 📣 Citation
 
