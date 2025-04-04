@@ -9,7 +9,7 @@
 
 ## 🧠 Overview
 
-**GROUNDMORE** introduces a new task: **Motion-Grounded Video Reasoning**, where models must answer motion-centric questions using **spatiotemporal segmentation masks** as visual responses.
+We introduces a new task: **Motion-Grounded Video Reasoning**, where models must answer motion-related questions using **spatiotemporal segmentation masks** as visual responses.
 
 This task addresses key limitations in prior video understanding research by introducing:
 - ❓ Implicit question-based reasoning  
@@ -34,7 +34,7 @@ The **Motion-Grounded Video Reasoning** task requires models to:
 
 - **Input**:  
   - A video clip `V ∈ ℝᵗˣʰˣʷˣ³`  
-  - A motion-centric question `Q`
+  - A motion-related question `Q`
 
 - **Output**:  
   - Spatiotemporal segmentation masks `M ∈ ℝᵗ′ˣʰˣʷ` highlighting the target object
@@ -50,7 +50,7 @@ We collect a new benchmark dataset: **GROUNDMORE**, designed to evaluate fine-gr
 - **1.7K** high-resolution video clips  
 - **7.6K** question-answer pairs  
 - **249K** object-level spatiotemporal masks  
-- Diverse video categories: family scenes, animal activities, ball games, and outdoor events
+- Diverse video categories: family scene, animal, ball game, and outdoor activity
 
 ---
 
@@ -58,7 +58,7 @@ We collect a new benchmark dataset: **GROUNDMORE**, designed to evaluate fine-gr
 
 ![Table 1: Comparison of motion understanding tasks](assets/table1_task.png)
 
-> **Table 1**: Only GROUNDMORE supports all dimensions: spatial & temporal context, motion abstraction, pixel-level output, and implicit reasoning.
+> **Table 1**: Motion-Grounded Video Reasoning supports all dimensions: spatial & temporal context, motion abstraction, pixel-level output, and implicit reasoning.
 
 ---
 
@@ -66,7 +66,7 @@ We collect a new benchmark dataset: **GROUNDMORE**, designed to evaluate fine-gr
 
 ![Table 2: Dataset statistics](assets/table2_dataset.png)
 
-> **Table 2**: GROUNDMORE contains more dense QA + segmentation annotations than prior benchmarks, especially in motion-focused reasoning.
+> **Table 2**: GROUNDMORE contains more dense QA + segmentation annotations than prior benchmarks, especially in motion-related reasoning.
 
 ---
 
@@ -74,11 +74,11 @@ We collect a new benchmark dataset: **GROUNDMORE**, designed to evaluate fine-gr
 
 We propose a baseline model called **MoRA**, built for this task. It integrates:
 
-- **LLaVA** for question reasoning  
-- **SAM** for spatial segmentation  
-- **[SEG] token** for object query  
+- **LLaVA** for multimodal reasoning  
+- **SAM** decoder for spatial mask decoding  
+- **[SEG] token** for object semantic embedding  
 - **[LOC] token** for temporal localization of motion events  
-- **Spatiotemporal pooling** from video transformer encoders  
+<!-- - **Spatiotemporal pooling** from video transformer encoders   -->
 
 ---
 
@@ -86,7 +86,7 @@ We propose a baseline model called **MoRA**, built for this task. It integrates:
 
 ![Figure 3: MoRA Model Architecture](assets/pipeline.png)
 
-> **Figure 3**: MoRA outputs pixel-level segmentation masks conditioned on the temporal boundary and textual question.
+> **Figure 3**: MoRA outputs pixel-level segmentation masks as response for the input motion-related question.
 
 ---
 
@@ -96,7 +96,7 @@ We propose a baseline model called **MoRA**, built for this task. It integrates:
 
 ![Table 3: Benchmark Results](assets/quant_mgvr_v2.png)
 
-> **Table 3**: MoRA achieves SOTA on all question types, outperforming strong RVOS, video reasoning, and multimodal models by a large margin.
+> **Table 3**: MoRA achieves SOTA on all question types, outperforming previous baseline models.
 
 ---
 
@@ -104,7 +104,7 @@ We propose a baseline model called **MoRA**, built for this task. It integrates:
 
 ![Table 5: Temporal localization ablation](assets/table5_zs_ft.png)
 
-> **Table 5**: Temporal localization via [LOC] token significantly improves performance, especially for sequential and counterfactual questions.
+> **Table 5**: Temporal localization via [LOC] token significantly improves performance.
 
 ---
 
