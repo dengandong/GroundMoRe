@@ -123,6 +123,10 @@ pip install -r requirements.txt
 
 ## 🚀 Usage
 
+### GroundMoRe Download
+GroundMoRe is available at: 
+https://huggingface.co/datasets/groundmore/GroundMoRe
+
 ### Training
 Before training, you need to obtain [LISA](https://huggingface.co/xinlai/LISA-7B-v1/tree/main) and [SAM](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth) for model initialization.
 
@@ -157,3 +161,12 @@ If this work is useful for your research, please cite:
   year={2025}
 }
 ```
+
+---
+
+## 🙏 Acknowledgements
+
+This work is built upon [LISA](https://github.com/dvlab-research/LISA) and [SAM](https://github.com/facebookresearch/segment-anything).
+
+We also appreciate the valueble help from [Wenshuo Chen](https://chatonz.github.io/) and [Erhang Zhang](https://scholar.google.com/citations?user=j1mUqHEAAAAJ&hl=en) during the GroundMoRe data collection.
+
