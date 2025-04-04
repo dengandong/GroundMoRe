@@ -174,5 +174,5 @@ If this work is useful for your research, please cite:
 
 This work is built upon [LISA](https://github.com/dvlab-research/LISA) and [SAM](https://github.com/facebookresearch/segment-anything).
 
-We also appreciate the valueble help from [Wenshuo Chen](https://chatonz.github.io/) and [Erhang Zhang](https://scholar.google.com/citations?user=j1mUqHEAAAAJ&hl=en) during the GroundMoRe data collection.
+We also appreciate the valuable help from [Wenshuo Chen](https://chatonz.github.io/) and [Erhang Zhang](https://scholar.google.com/citations?user=j1mUqHEAAAAJ&hl=en) during the GroundMoRe data collection.
 
