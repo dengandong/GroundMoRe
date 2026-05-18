@@ -1,17 +1,12 @@
 import argparse
-import glob
 import os
 import sys
 
-import cv2
-import numpy as np
 import torch
-import torch.nn.functional as F
 import transformers
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer
 
-from model.VideoTemporalLISA import VideoLISAForCausalLM
+from model.MoRA import MoRAForCausalLM
 from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
 
 
@@ -45,6 +40,18 @@ def parse_args(args):
     parser.add_argument("--train_mask_decoder", action="store_true", default=True)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument(
+        "--seg_only",
+        action="store_true",
+        default=False,
+        help="Disable [LOC] temporal localization and merge a [SEG]-only model.",
+    )
+    parser.add_argument(
+        "--loc_mode",
+        default="global",
+        choices=["frame", "global"],
+        help="Temporal localization head used by a [SEG]+[LOC] model.",
+    )
+    parser.add_argument(
         "--conv_type",
         default="llava_v1",
         type=str,
@@ -70,6 +77,12 @@ def main(args):
     tokenizer.pad_token = tokenizer.unk_token
     num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    args.use_loc_token = not args.seg_only
+    if args.use_loc_token:
+        tokenizer.add_tokens("[LOC]")
+        args.loc_token_idx = tokenizer("[LOC]", add_special_tokens=False).input_ids[0]
+    else:
+        args.loc_token_idx = None
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
@@ -80,7 +93,12 @@ def main(args):
         "train_mask_decoder": args.train_mask_decoder,
         "out_dim": args.out_dim,
         "seg_token_idx": args.seg_token_idx,
+        "loc_token_idx": args.loc_token_idx,
+        "use_loc_token": args.use_loc_token,
+        "loc_mode": args.loc_mode,
         "vision_tower": args.vision_tower,
+        "vision_pretrained": args.vision_pretrained,
+        "use_mm_start_end": args.use_mm_start_end,
     }
 
     torch_dtype = torch.float32
@@ -88,8 +106,8 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    model = VideoLISAForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+    model = MoRAForCausalLM.from_pretrained(
+        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=False, **model_args
     )
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
@@ -98,7 +116,8 @@ def main(args):
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype)
-    model.get_model().initialize_lisa_modules(model.get_model().config)
+    if not hasattr(model.get_model(), "visual_model"):
+        model.get_model().initialize_lisa_modules(model.get_model().config)
 
     lora_r = args.lora_r
     if lora_r > 0:

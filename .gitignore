@@ -3,6 +3,43 @@ MoRA-ZA-7B/
 
 # Ignore specific script
 hf_upload.py
+eval_one.sh
 
 __pycache__/
 *.py[cod]
+
+# Datasets and local evaluation assets
+/dataset/
+/dataset
+/MeViSv2/
+/MeViSv2
+/groundmore_videos/
+/groundmore_videos
+/groundmore_test.json
+
+# Experiment outputs and checkpoints
+/checkpoints/
+/outputs/
+/experiments/
+/results/
+/eval_outputs/
+/eval_results/
+/vis_output/
+/wandb/
+/runs/
+/slurm/
+/.cache/
+*.pt
+*.pth
+*.safetensors
+*.bin
+ckpt_model*/
+
+# Local result summaries
+/*results*.txt
+/*eval_results*.txt
+/*loc_results*.txt
+
+# Local maintenance / one-off cluster scripts
+/scripts/watch_keep_epoch_ckpts.sh
+/scripts/train_mora_h200_f20_bs2.sbatch

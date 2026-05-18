@@ -9,24 +9,20 @@ import torch.nn.functional as F
 from pycocotools import mask
 from transformers import CLIPImageProcessor
 
-from model.llava import conversation as conversation_lib
-from model.llava.constants import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX,
-                                   IMAGE_TOKEN_INDEX)
-from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
 from .conversation import get_default_conv_template
 from .data_processing import get_mask_from_json
-from .refer import REFER
-from .refer_video_seg_dataset import YTVOSDataset
 from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                    DEFAULT_IMAGE_TOKEN)
-from .vqa_dataset import VQADataset
+                    DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX)
 
 
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
 ):
+    from model.llava import conversation as conversation_lib
+    from model.llava.mm_utils import tokenizer_image_token
+
     # image_path_list = []
     images_list = []
     images_clip_list = []
@@ -36,25 +32,43 @@ def collate_fn(
     resize_list = []
     questions_list = []
     sampled_classes_list = []
+    loc_targets_list = []
     offset_list = [0]
     cnt = 0
     inferences = []
     video_id_list = []
     exp_id_list = []
-    for (
-        # image_path,
-        images,
-        images_clip,
-        conversations,
-        masks,
-        label,
-        resize,
-        questions,
-        sampled_classes,
-        video_id,
-        exp_id,
-        inference
-    ) in batch:
+    for sample in batch:
+        if len(sample) == 12:
+            (
+                images,
+                images_clip,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+                video_id,
+                exp_id,
+                loc_targets,
+                inference,
+            ) = sample
+        else:
+            (
+                images,
+                images_clip,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+                video_id,
+                exp_id,
+                inference,
+            ) = sample
+            loc_targets = (masks.flatten(1).sum(dim=1) > 0).float()
         # image_path_list.append(image_path)
         images_list.append(images)
         images_clip_list.append(images_clip)
@@ -64,6 +78,7 @@ def collate_fn(
         resize_list.append(resize)
         questions_list.append(questions)
         sampled_classes_list.append(sampled_classes)
+        loc_targets_list.append(loc_targets.float())
         cnt += len(conversations)
         offset_list.append(cnt)
         inferences.append(inference)
@@ -159,10 +174,199 @@ def collate_fn(
         "offset": torch.LongTensor(offset_list),
         "questions_list": questions_list,
         "sampled_classes_list": sampled_classes_list,
+        "loc_targets_list": loc_targets_list,
         "inference": inferences[0],
         "conversation_list": conversation_list,
         "video_id_list": video_id_list,
         "exp_id_list": exp_id_list
+    }
+
+
+def _qwen_messages(question, answer=None):
+    question = question.replace(DEFAULT_IMAGE_TOKEN, "").strip()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": question},
+            ],
+        }
+    ]
+    if answer is not None:
+        messages.append({"role": "assistant", "content": answer})
+    return messages
+
+
+def qwen_collate_fn(
+    batch,
+    processor=None,
+    tokenizer=None,
+    model_max_length=1024,
+    use_loc_token=True,
+    local_rank=-1,
+):
+    if processor is None:
+        raise ValueError("qwen_collate_fn requires a Qwen AutoProcessor.")
+    if tokenizer is None:
+        tokenizer = processor.tokenizer
+
+    images_list = []
+    images_clip_list = []
+    masks_list = []
+    label_list = []
+    resize_list = []
+    questions_list = []
+    sampled_classes_list = []
+    loc_targets_list = []
+    qwen_images_list = []
+    offset_list = [0]
+    cnt = 0
+    inferences = []
+    video_id_list = []
+    exp_id_list = []
+    full_texts = []
+    prompt_texts = []
+    first_images = []
+    frame_texts = []
+    frame_images = []
+    answer = "[SEG], [LOC]." if use_loc_token else "[SEG]."
+
+    for sample in batch:
+        if len(sample) == 12:
+            (
+                images,
+                images_clip,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+                video_id,
+                exp_id,
+                qwen_images,
+                inference,
+            ) = sample
+            loc_targets = (masks.flatten(1).sum(dim=1) > 0).float()
+        elif len(sample) == 13:
+            (
+                images,
+                images_clip,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+                video_id,
+                exp_id,
+                loc_targets,
+                qwen_images,
+                inference,
+            ) = sample
+        else:
+            raise ValueError(
+                "Qwen collate expects samples with qwen_images. Got sample "
+                f"length {len(sample)}."
+            )
+
+        images_list.append(images)
+        images_clip_list.append(images_clip)
+        masks_list.append(masks.float())
+        label_list.append(label)
+        resize_list.append(resize)
+        questions_list.append(questions)
+        sampled_classes_list.append(sampled_classes)
+        loc_targets_list.append(loc_targets.float())
+        qwen_images_list.append(qwen_images)
+        cnt += len(questions)
+        offset_list.append(cnt)
+        inferences.append(inference)
+        video_id_list.append(video_id)
+        exp_id_list.append(exp_id)
+
+        if len(qwen_images) != images.size(0):
+            raise ValueError(
+                f"Expected {images.size(0)} Qwen images, got {len(qwen_images)}."
+            )
+        for question in questions:
+            full_texts.append(
+                processor.apply_chat_template(
+                    _qwen_messages(question, answer=answer),
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+            prompt_texts.append(
+                processor.apply_chat_template(
+                    _qwen_messages(question, answer=None),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+            first_images.append(qwen_images[0])
+        for image in qwen_images:
+            frame_texts.append(prompt_texts[-1])
+            frame_images.append(image)
+
+    full_inputs = processor(
+        text=full_texts,
+        images=first_images,
+        padding=True,
+        truncation=True,
+        max_length=model_max_length,
+        return_tensors="pt",
+    )
+    prompt_inputs = processor(
+        text=prompt_texts,
+        images=first_images,
+        padding=True,
+        truncation=True,
+        max_length=model_max_length,
+        return_tensors="pt",
+    )
+    frame_inputs = processor(
+        text=frame_texts,
+        images=frame_images,
+        padding=True,
+        truncation=True,
+        max_length=model_max_length,
+        return_tensors="pt",
+    )
+
+    input_ids = full_inputs["input_ids"]
+    attention_masks = full_inputs["attention_mask"].bool()
+    labels = input_ids.clone()
+    labels[~attention_masks] = IGNORE_INDEX
+    prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1).tolist()
+    for row_idx, prompt_len in enumerate(prompt_lengths):
+        labels[row_idx, : int(prompt_len)] = IGNORE_INDEX
+
+    return {
+        "images": torch.stack(images_list, dim=0),
+        "images_clip": torch.stack(images_clip_list, dim=0),
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_masks": attention_masks,
+        "pixel_values": frame_inputs["pixel_values"],
+        "image_grid_thw": frame_inputs["image_grid_thw"],
+        **(
+            {"mm_token_type_ids": full_inputs["mm_token_type_ids"]}
+            if "mm_token_type_ids" in full_inputs
+            else {}
+        ),
+        "masks_list": masks_list,
+        "label_list": label_list,
+        "resize_list": resize_list,
+        "offset": torch.LongTensor(offset_list),
+        "questions_list": questions_list,
+        "sampled_classes_list": sampled_classes_list,
+        "loc_targets_list": loc_targets_list,
+        "inference": inferences[0],
+        "conversation_list": full_texts,
+        "video_id_list": video_id_list,
+        "exp_id_list": exp_id_list,
     }
 
 
@@ -189,6 +393,9 @@ class VideoHybridDataset(torch.utils.data.Dataset):
         vqa_data="llava_instruct_150k",
         reason_seg_data="ReasonSeg|train",
         explanatory=0.1,
+        use_loc_token=True,
+        num_frames=5,
+        return_qwen_images=False,
     ):
         self.exclude_val = exclude_val
         self.dataset = dataset
@@ -204,6 +411,11 @@ class VideoHybridDataset(torch.utils.data.Dataset):
         self.precision = precision
 
         self.datasets = dataset.split("||")
+        if len(sample_rate) != len(self.datasets):
+            raise ValueError(
+                f"sample_rate has {len(sample_rate)} entries but dataset has "
+                f"{len(self.datasets)} entries: {self.datasets}"
+            )
 
         self.all_datasets = []
         for dataset in self.datasets:
@@ -223,24 +435,77 @@ class VideoHybridDataset(torch.utils.data.Dataset):
                 #     )
                 # )
             elif dataset == "refer_video_seg":
+                from .refer_video_seg_dataset import YTVOSDataset
+
                 self.all_datasets.append(
                     YTVOSDataset(
-                        img_folder="/data/refytvos/train",
-                        ann_file="/data/refytvos/meta_expressions/train/meta_expressions.json",
+                        img_folder=os.path.join(base_image_dir, "refytvos", "train"),
+                        ann_file=os.path.join(
+                            base_image_dir,
+                            "refytvos",
+                            "meta_expressions",
+                            "train",
+                            "meta_expressions.json",
+                        ),
                         tokenizer=tokenizer,
                         vision_tower=vision_tower,
                         # samples_per_epoch,
                         # precision,
                         image_size=image_size,
-                        num_frames=5,
+                        num_frames=num_frames,
                         max_skip=3,
                         return_masks=False,
+                        use_loc_token=use_loc_token,
+                        return_qwen_images=return_qwen_images,
                         # num_classes_per_sample,
                         # exclude_val,
                         # refer_seg_data,
                     )
                 )
+            elif dataset == "mevis":
+                from .mevis_dataset import MeViSDataset
+
+                self.all_datasets.append(
+                    MeViSDataset(
+                        img_folder=os.path.join(base_image_dir, "MeViSv2", "train"),
+                        ann_file=os.path.join(
+                            base_image_dir,
+                            "MeViSv2",
+                            "train",
+                            "meta_expressions.json",
+                        ),
+                        tokenizer=tokenizer,
+                        vision_tower=vision_tower,
+                        image_size=image_size,
+                        num_frames=num_frames,
+                        max_skip=3,
+                        return_masks=False,
+                        use_loc_token=use_loc_token,
+                        return_qwen_images=return_qwen_images,
+                    )
+                )
+            elif dataset == "groundmore":
+                from .groundmore_dataset import GroundMoReDataset
+
+                self.all_datasets.append(
+                    GroundMoReDataset(
+                        root_dir=os.path.join(base_image_dir, "GroundMoRe"),
+                        ann_file=os.path.join(
+                            base_image_dir,
+                            "GroundMoRe",
+                            "trainval_v2.json",
+                        ),
+                        tokenizer=tokenizer,
+                        vision_tower=vision_tower,
+                        image_size=image_size,
+                        num_frames=num_frames,
+                        use_loc_token=use_loc_token,
+                        return_qwen_images=return_qwen_images,
+                    )
+                )
             elif dataset == "video_qa":
+                from .vqa_dataset import VQADataset
+
                 self.all_datasets.append(
                     VQADataset(
                         base_image_dir,
@@ -270,6 +535,8 @@ class VideoHybridDataset(torch.utils.data.Dataset):
                 #         explanatory,
                 #     )
                 # )
+            else:
+                raise ValueError(f"Unsupported video dataset: {dataset}")
 
     def __len__(self):
         return self.samples_per_epoch
@@ -305,6 +572,8 @@ class ValDataset(torch.utils.data.Dataset):
             self.images = images
             self.data_type = "reason_seg"
         elif len(splits) == 3:
+            from .refer import REFER
+
             ds, splitBy, split = splits
             refer_api = REFER(self.base_image_dir, ds, splitBy)
             ref_ids_val = refer_api.getRefIds(split=split)
@@ -396,6 +665,8 @@ class ValDataset(torch.utils.data.Dataset):
             json_path = image_path.replace(".jpg", ".json")
             mask_json, sampled_sents, is_sentence = get_mask_from_json(json_path, image)
             sampled_sents = [sampled_sents[0]]
+
+        from model.llava import conversation as conversation_lib
 
         conversations = []
         conv = conversation_lib.default_conversation.copy()

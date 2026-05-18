@@ -69,6 +69,7 @@ def parse_args(args):
     parser.add_argument(
         "--batch_size", default=1, type=int, help="batch size per device per step"
     )
+    parser.add_argument("--num_frames", default=5, type=int, help="video frames per training sample")
     parser.add_argument(
         "--grad_accumulation_steps",
         default=10,
@@ -80,6 +81,14 @@ def parse_args(args):
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
     parser.add_argument("--bce_loss_weight", default=2.0, type=float)
+    parser.add_argument("--loc_loss_weight", default=1.0, type=float)
+    parser.add_argument("--global_loc_loss_weight", default=1.0, type=float)
+    parser.add_argument(
+        "--loc_mode",
+        default="global",
+        choices=["frame", "global"],
+        help="Temporal localization head to train when [LOC] is enabled.",
+    )
     parser.add_argument("--lora_alpha", default=16, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
     parser.add_argument("--lora_target_modules", default="q_proj,v_proj", type=str)
@@ -95,11 +104,29 @@ def parse_args(args):
     parser.add_argument("--weight", default="", type=str)
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
+    parser.add_argument(
+        "--visualize_freq",
+        default=100,
+        type=int,
+        help="TensorBoard image visualization frequency in optimizer steps. Set <=0 to disable.",
+    )
     parser.add_argument("--start_epoch", default=0, type=int)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--train_mask_decoder", action="store_true", default=True)
+    parser.add_argument(
+        "--seg_only",
+        action="store_true",
+        default=False,
+        help="Disable [LOC] temporal localization and train with [SEG] only.",
+    )
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument("--auto_resume", action="store_true", default=False)
+    parser.add_argument(
+        "--keep_ckpt_every",
+        default=5,
+        type=int,
+        help="Keep a permanent checkpoint copy every N epochs; 0 disables it.",
+    )
     parser.add_argument("--pad_to_multiple_of", default=8, type=int, help="FP16-->8, FP16&A100-->64")
     parser.add_argument(
         "--conv_type",
@@ -131,6 +158,12 @@ def main(args):
     tokenizer.pad_token = tokenizer.unk_token
     num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    args.use_loc_token = not args.seg_only
+    if args.use_loc_token:
+        tokenizer.add_tokens("[LOC]")
+        args.loc_token_idx = tokenizer("[LOC]", add_special_tokens=False).input_ids[0]
+    else:
+        args.loc_token_idx = None
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
@@ -143,7 +176,12 @@ def main(args):
         "ce_loss_weight": args.ce_loss_weight,
         "dice_loss_weight": args.dice_loss_weight,
         "bce_loss_weight": args.bce_loss_weight,
+        "loc_loss_weight": args.loc_loss_weight,
+        "global_loc_loss_weight": args.global_loc_loss_weight,
+        "loc_mode": args.loc_mode,
         "seg_token_idx": args.seg_token_idx,
+        "loc_token_idx": args.loc_token_idx,
+        "use_loc_token": args.use_loc_token,
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
@@ -155,7 +193,11 @@ def main(args):
         torch_dtype = torch.half
     
     model = MoRAForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, empty_init=False, **model_args
+        args.version,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=False,
+        empty_init=False,
+        **model_args,
     )
     
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -168,7 +210,11 @@ def main(args):
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype, device=args.local_rank)
-    model.get_model().initialize_lisa_modules(model.get_model().config)
+    if not (
+        hasattr(model.get_model(), "visual_model")
+        and hasattr(model.get_model(), "text_hidden_fcs")
+    ):
+        model.get_model().initialize_lisa_modules(model.get_model().config)
 
     for n, p in vision_tower.named_parameters():
         if 'adapter' in n:
@@ -232,7 +278,7 @@ def main(args):
         if any(
             [
                 x in n
-                for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs", "seg_token_temporal_module", "adapter"]  # here controls the newly defined blocks that need training. E.g., temporal adaptor in MoRA
+                for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs", "loc_temporal_head", "loc_global", "adapter"]  # here controls the newly defined blocks that need training.
             ]
         ):
             print("n: ", n, "p.shape: ", p.shape)
@@ -259,6 +305,8 @@ def main(args):
         vqa_data=args.vqa_data,
         reason_seg_data=args.reason_seg_data,
         explanatory=args.explanatory,
+        use_loc_token=args.use_loc_token,
+        num_frames=args.num_frames,
     )
 
     if args.no_eval == False:
@@ -285,6 +333,7 @@ def main(args):
                 "lr": args.lr,
                 "weight_decay": 0.0,
                 "betas": (args.beta1, args.beta2),
+                "torch_adam": True,
             },
         },
         "scheduler": {
@@ -409,6 +458,16 @@ def main(args):
                     shutil.rmtree(save_dir)
             torch.distributed.barrier()
             model_engine.save_checkpoint(save_dir)
+            torch.distributed.barrier()
+            if (
+                args.local_rank == 0
+                and args.keep_ckpt_every > 0
+                and (epoch + 1) % args.keep_ckpt_every == 0
+            ):
+                keep_dir = os.path.join(args.log_dir, f"ckpt_model_epoch_{epoch + 1:03d}")
+                if os.path.exists(keep_dir):
+                    shutil.rmtree(keep_dir)
+                shutil.copytree(save_dir, keep_dir)
 
 
 def train(
@@ -428,14 +487,21 @@ def train(
     mask_bce_losses = AverageMeter("MaskBCELoss", ":.4f")
     mask_dice_losses = AverageMeter("MaskDICELoss", ":.4f")
     mask_losses = AverageMeter("MaskLoss", ":.4f")
+    loc_losses = AverageMeter("LocLoss", ":.4f")
+    loc_frame_losses = AverageMeter("LocFrameLoss", ":.4f")
+    loc_global_losses = AverageMeter("LocGlobalLoss", ":.4f")
 
     progress = ProgressMeter(
         args.steps_per_epoch,
         [
             batch_time,
+            data_time,
             losses,
             ce_losses,
             mask_losses,
+            loc_losses,
+            loc_frame_losses,
+            loc_global_losses,
             mask_bce_losses,
             mask_dice_losses,
         ],
@@ -458,13 +524,28 @@ def train(
 
             if args.precision == "fp16":
                 input_dict["images"] = input_dict["images"].half()
-                input_dict["images_clip"] = input_dict["images_clip"].half()
+                if "images_clip" in input_dict:
+                    input_dict["images_clip"] = input_dict["images_clip"].half()
+                if "pixel_values" in input_dict:
+                    input_dict["pixel_values"] = input_dict["pixel_values"].half()
+                if "pixel_values_videos" in input_dict:
+                    input_dict["pixel_values_videos"] = input_dict["pixel_values_videos"].half()
             elif args.precision == "bf16":
                 input_dict["images"] = input_dict["images"].bfloat16()
-                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+                if "images_clip" in input_dict:
+                    input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+                if "pixel_values" in input_dict:
+                    input_dict["pixel_values"] = input_dict["pixel_values"].bfloat16()
+                if "pixel_values_videos" in input_dict:
+                    input_dict["pixel_values_videos"] = input_dict["pixel_values_videos"].bfloat16()
             else:
                 input_dict["images"] = input_dict["images"].float()
-                input_dict["images_clip"] = input_dict["images_clip"].float()
+                if "images_clip" in input_dict:
+                    input_dict["images_clip"] = input_dict["images_clip"].float()
+                if "pixel_values" in input_dict:
+                    input_dict["pixel_values"] = input_dict["pixel_values"].float()
+                if "pixel_values_videos" in input_dict:
+                    input_dict["pixel_values_videos"] = input_dict["pixel_values_videos"].float()
 
             output_dict = model(**input_dict)
 
@@ -473,6 +554,9 @@ def train(
             mask_bce_loss = output_dict["mask_bce_loss"]
             mask_dice_loss = output_dict["mask_dice_loss"]
             mask_loss = output_dict["mask_loss"]
+            loc_loss = output_dict.get("loc_loss", torch.zeros_like(loss))
+            loc_frame_loss = output_dict.get("loc_frame_loss", torch.zeros_like(loss))
+            loc_global_loss = output_dict.get("loc_global_loss", torch.zeros_like(loss))
 
             raw_frames = output_dict["raw_frames"]
             pred_masks = output_dict["pred_masks"]
@@ -484,6 +568,9 @@ def train(
             mask_bce_losses.update(mask_bce_loss.item(), input_dict["images"].size(0))
             mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
             mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
+            loc_losses.update(loc_loss.item(), input_dict["images"].size(0))
+            loc_frame_losses.update(loc_frame_loss.item(), input_dict["images"].size(0))
+            loc_global_losses.update(loc_global_loss.item(), input_dict["images"].size(0))
             model.backward(loss)
             model.step()
 
@@ -501,6 +588,9 @@ def train(
                 mask_bce_losses.all_reduce()
                 mask_dice_losses.all_reduce()
                 mask_losses.all_reduce()
+                loc_losses.all_reduce()
+                loc_frame_losses.all_reduce()
+                loc_global_losses.all_reduce()
 
             if args.local_rank == 0:
                 progress.display(global_step + 1)
@@ -514,25 +604,35 @@ def train(
                     "train/mask_dice_loss", mask_dice_losses.avg, cur_step
                 )
                 writer.add_scalar("train/mask_loss", mask_losses.avg, cur_step)
+                writer.add_scalar("train/loc_loss", loc_losses.avg, cur_step)
+                writer.add_scalar("train/loc_frame_loss", loc_frame_losses.avg, cur_step)
+                writer.add_scalar("train/loc_global_loss", loc_global_losses.avg, cur_step)
                 writer.add_scalar(
                     "metrics/total_secs_per_batch", batch_time.avg, cur_step
                 )
                 writer.add_scalar(
                     "metrics/data_secs_per_batch", data_time.avg, cur_step
                 )
-                concat_raw_frames = torch.cat([tensor_norm(raw_frames[i]) for i in range(raw_frames.size(0))], dim=2)  
-                concat_pred_masks = torch.cat([pred_masks[i] for i in range(pred_masks.size(0))], dim=1)  
-                concat_gt_masks = torch.cat([gt_masks[i] for i in range(gt_masks.size(0))], dim=1)
-                concat_raw_frames, concat_pred_masks, concat_gt_masks = mid_reshape(concat_raw_frames), mid_reshape(concat_pred_masks), mid_reshape(concat_gt_masks)
+                if args.visualize_freq > 0 and cur_step % args.visualize_freq == 0:
+                    try:
+                        raw_grid = make_frame_grid(tensor_norm(raw_frames))
+                        pred_grid = make_frame_grid(pred_masks)
+                        gt_grid = make_frame_grid(gt_masks)
 
-                # Convert tensors to matplotlib figures and log to TensorBoard
-                writer.add_figure("visualization/raw_frames", tensor_to_figure(concat_raw_frames, text=questions), cur_step)
-                writer.add_figure("visualization/pred_masks_soft", tensor_to_figure(concat_pred_masks, cmap="gray", mask="soft"), cur_step)
-                writer.add_figure("visualization/pred_masks_hard", tensor_to_figure(concat_pred_masks, cmap="gray", mask="hard"), cur_step)
-                # writer.add_figure("visualization/pred_masks_hard_t0.8", tensor_to_figure(concat_pred_masks, cmap="gray", mask="hard", threshold=0.8), global_step)
-                # writer.add_figure("visualization/pred_masks_hard_t0.9", tensor_to_figure(concat_pred_masks, cmap="gray", mask="hard", threshold=0.9), global_step)
-                writer.add_figure("visualization/gt_masks", tensor_to_figure(concat_gt_masks, cmap="gray"), cur_step)
-                writer.add_text('visualization/question', questions, cur_step)
+                        raw_fig = tensor_to_figure(raw_grid, text=questions)
+                        pred_soft_fig = tensor_to_figure(pred_grid, cmap="gray", mask="soft")
+                        pred_hard_fig = tensor_to_figure(pred_grid, cmap="gray", mask="hard")
+                        gt_fig = tensor_to_figure(gt_grid, cmap="gray")
+
+                        writer.add_figure("visualization/raw_frames", raw_fig, cur_step)
+                        writer.add_figure("visualization/pred_masks_soft", pred_soft_fig, cur_step)
+                        writer.add_figure("visualization/pred_masks_hard", pred_hard_fig, cur_step)
+                        writer.add_figure("visualization/gt_masks", gt_fig, cur_step)
+                        writer.add_text('visualization/question', questions, cur_step)
+                        for fig in (raw_fig, pred_soft_fig, pred_hard_fig, gt_fig):
+                            plt.close(fig)
+                    except Exception as exc:
+                        print(f"Skipping TensorBoard visualization at step {cur_step}: {exc}")
 
 
             batch_time.reset()
@@ -542,6 +642,9 @@ def train(
             mask_bce_losses.reset()
             mask_dice_losses.reset()
             mask_losses.reset()
+            loc_losses.reset()
+            loc_frame_losses.reset()
+            loc_global_losses.reset()
 
         # if global_step != 0:
         #     curr_lr = scheduler.get_last_lr()
@@ -564,13 +667,28 @@ def validate(val_loader, model_engine, epoch, writer, args):
         input_dict = dict_to_cuda(input_dict)
         if args.precision == "fp16":
             input_dict["images"] = input_dict["images"].half()
-            input_dict["images_clip"] = input_dict["images_clip"].half()
+            if "images_clip" in input_dict:
+                input_dict["images_clip"] = input_dict["images_clip"].half()
+            if "pixel_values" in input_dict:
+                input_dict["pixel_values"] = input_dict["pixel_values"].half()
+            if "pixel_values_videos" in input_dict:
+                input_dict["pixel_values_videos"] = input_dict["pixel_values_videos"].half()
         elif args.precision == "bf16":
             input_dict["images"] = input_dict["images"].bfloat16()
-            input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+            if "images_clip" in input_dict:
+                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+            if "pixel_values" in input_dict:
+                input_dict["pixel_values"] = input_dict["pixel_values"].bfloat16()
+            if "pixel_values_videos" in input_dict:
+                input_dict["pixel_values_videos"] = input_dict["pixel_values_videos"].bfloat16()
         else:
             input_dict["images"] = input_dict["images"].float()
-            input_dict["images_clip"] = input_dict["images_clip"].float()
+            if "images_clip" in input_dict:
+                input_dict["images_clip"] = input_dict["images_clip"].float()
+            if "pixel_values" in input_dict:
+                input_dict["pixel_values"] = input_dict["pixel_values"].float()
+            if "pixel_values_videos" in input_dict:
+                input_dict["pixel_values_videos"] = input_dict["pixel_values_videos"].float()
 
         with torch.no_grad():
             output_dict = model_engine(**input_dict)
@@ -636,19 +754,31 @@ def tensor_to_figure(tensor, text=None, cmap=None, mask="soft", threshold=0.5):
 def tensor_norm(tensor):
     tensor_max = tensor.max()
     tensor_min = tensor.min()
-    tensor = (tensor - tensor_min) / (tensor_max - tensor_min)
+    tensor = (tensor - tensor_min) / (tensor_max - tensor_min + 1e-6)
     return tensor
 
 
-def mid_reshape(tensor):
-    # input size: [x, y, 2z]
-    # dim: 2
-    # return tensor: [x, 2y, z]
-    size = tensor.size(-1)
-    a = tensor[..., :size//2]
-    b = tensor[..., size//2:]
-    new_tensor = torch.cat((a, b), dim=-2)
-    return new_tensor
+def make_frame_grid(tensor, nrow=None, pad_value=0):
+    if tensor.dim() == 3:
+        tensor = tensor.unsqueeze(1)
+    if tensor.dim() != 4:
+        raise ValueError(f"Expected [T, C, H, W] or [T, H, W], got {tuple(tensor.shape)}")
+
+    num_frames, channels, height, width = tensor.shape
+    if nrow is None:
+        nrow = int(np.ceil(np.sqrt(num_frames)))
+    ncol = int(np.ceil(num_frames / nrow))
+    pad_frames = nrow * ncol - num_frames
+    if pad_frames > 0:
+        padding = tensor.new_full((pad_frames, channels, height, width), pad_value)
+        tensor = torch.cat([tensor, padding], dim=0)
+
+    tensor = tensor.view(ncol, nrow, channels, height, width)
+    tensor = tensor.permute(2, 0, 3, 1, 4).contiguous()
+    grid = tensor.view(channels, ncol * height, nrow * width)
+    if grid.size(0) == 1:
+        grid = grid[0]
+    return grid
 
 
 if __name__ == "__main__":

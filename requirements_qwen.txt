@@ -1,0 +1,46 @@
+# Recommended base on a normal CUDA x86_64 machine:
+#   conda create -n mora_qwen python=3.10 -y
+#   conda activate mora_qwen
+#   pip install -U pip setuptools wheel
+#   pip install -r requirements_qwen.txt
+#
+# Qwen3-VL needs transformers>=4.57.0 for Qwen3VLForConditionalGeneration.
+# On GH200/aarch64, the PyPI torch wheels can be CPU-only. Use the cluster CUDA
+# torch build (this venv currently uses torch==2.5.0+CUDA 12.4 copied from
+# hvp_vila2) before building flash-attn.
+# For GH200 flash_attention_2, build with:
+#   FLASH_ATTN_CUDA_ARCHS=90 MAX_JOBS=4 pip install flash-attn==2.7.4.post1 --no-build-isolation
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+transformers>=4.57.0
+accelerate>=1.1.0
+tokenizers>=0.21.0
+safetensors>=0.4.5
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+qwen-vl-utils>=0.0.14
+
+deepspeed>=0.15.4
+peft>=0.13.2
+bitsandbytes>=0.44.1
+einops>=0.8.0
+ninja>=1.11.1
+packaging>=24.0
+
+numpy==1.26.4
+opencv-python>=4.10.0.84
+Pillow>=10.4.0
+pycocotools>=2.0.8
+scipy>=1.11.4
+matplotlib>=3.8.0
+tensorboard>=2.17.0
+tqdm>=4.66.0
+requests>=2.32.0
+shortuuid>=1.0.13
+
+av>=12.0.0

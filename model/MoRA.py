@@ -105,6 +105,31 @@ class MoRAMetaModel:
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
 
+        if getattr(config, "use_loc_token", False):
+            self.loc_temporal_head = nn.Sequential(
+                nn.Linear(in_dim, in_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(in_dim, 1),
+            )
+            self.loc_temporal_head.train()
+            for param in self.loc_temporal_head.parameters():
+                param.requires_grad = True
+            self.loc_global_context_proj = nn.Sequential(
+                nn.Linear(in_dim, in_dim),
+                nn.ReLU(inplace=True),
+            )
+            self.loc_global_temporal_head = nn.Sequential(
+                nn.Linear(in_dim * 2, in_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(in_dim, 1),
+            )
+            self.loc_global_context_proj.train()
+            self.loc_global_temporal_head.train()
+            for param in self.loc_global_context_proj.parameters():
+                param.requires_grad = True
+            for param in self.loc_global_temporal_head.parameters():
+                param.requires_grad = True
+
 
 class MoRAModel(MoRAMetaModel, LlavaLlamaModel):
     def __init__(
@@ -136,11 +161,42 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
             config.mm_vision_tower = kwargs.get(
                 "vision_tower", "openai/clip-vit-large-patch14"
             )
-            self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
-            self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
-            self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
 
-        self.seg_token_idx = kwargs.pop("seg_token_idx")
+        self.ce_loss_weight = kwargs.pop(
+            "ce_loss_weight", getattr(config, "ce_loss_weight", 1.0)
+        )
+        self.dice_loss_weight = kwargs.pop(
+            "dice_loss_weight", getattr(config, "dice_loss_weight", 0.5)
+        )
+        self.bce_loss_weight = kwargs.pop(
+            "bce_loss_weight", getattr(config, "bce_loss_weight", 2.0)
+        )
+        self.loc_loss_weight = kwargs.pop(
+            "loc_loss_weight", getattr(config, "loc_loss_weight", 1.0)
+        )
+        self.global_loc_loss_weight = kwargs.pop(
+            "global_loc_loss_weight", getattr(config, "global_loc_loss_weight", 1.0)
+        )
+        self.loc_mode = kwargs.pop("loc_mode", getattr(config, "loc_mode", "global"))
+
+        self.seg_token_idx = kwargs.pop(
+            "seg_token_idx", getattr(config, "seg_token_idx", None)
+        )
+        self.loc_token_idx = kwargs.pop(
+            "loc_token_idx", getattr(config, "loc_token_idx", None)
+        )
+        self.use_loc_token = kwargs.pop(
+            "use_loc_token", getattr(config, "use_loc_token", False)
+        )
+        config.ce_loss_weight = self.ce_loss_weight
+        config.dice_loss_weight = self.dice_loss_weight
+        config.bce_loss_weight = self.bce_loss_weight
+        config.loc_loss_weight = self.loc_loss_weight
+        config.global_loc_loss_weight = self.global_loc_loss_weight
+        config.loc_mode = self.loc_mode
+        config.seg_token_idx = self.seg_token_idx
+        config.loc_token_idx = self.loc_token_idx
+        config.use_loc_token = self.use_loc_token
 
         super().__init__(config)
 
@@ -152,6 +208,10 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
         self.post_init()
 
     def get_visual_embs(self, pixel_values: torch.FloatTensor):
+        if pixel_values.dim() == 5:
+            pixel_values = pixel_values.view(
+                -1, pixel_values.size(-3), pixel_values.size(-2), pixel_values.size(-1)
+            )
         with torch.no_grad():
             image_embeddings_list = []
             for i in range(pixel_values.shape[0]):
@@ -180,6 +240,7 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
         masks_list: List[torch.FloatTensor],  # len==b --> len == b, [t, xx]
         label_list: List[torch.Tensor],
         resize_list: List[tuple],
+        loc_targets_list: List[torch.Tensor] = None,
         inference: bool = False,
         **kwargs,
     ):
@@ -221,6 +282,23 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
             [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
             dim=1,
         )
+        loc_token_mask = None
+        if self.use_loc_token and self.loc_token_idx is not None:
+            loc_token_mask = input_ids[:, 1:] == self.loc_token_idx
+            loc_token_mask = torch.cat(
+                [
+                    loc_token_mask,
+                    torch.zeros((loc_token_mask.shape[0], 1)).bool().cuda(),
+                ],
+                dim=1,
+            )
+            loc_token_mask = torch.cat(
+                [
+                    torch.zeros((loc_token_mask.shape[0], 255)).bool().cuda(),
+                    loc_token_mask,
+                ],
+                dim=1,
+            )
 
         ###
         # input_ids = input_ids * mix_token_mask  #  QA+[SEG]+[IMAGE]
@@ -310,6 +388,14 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
         multimask_output = False
         pred_masks = []
         for i in range(len(pred_embeddings)):
+            K_size = max(1, pred_embeddings[i].size(0) // t_size)
+            image_start = i * t_size
+            image_end = image_start + t_size
+            image_embeddings_i = image_embeddings[image_start:image_end]
+            if image_embeddings_i.size(0) != t_size:
+                image_embeddings_i = image_embeddings[:t_size]
+            if K_size > 1:
+                image_embeddings_i = image_embeddings_i.repeat(K_size, 1, 1, 1)
             (
                 sparse_embeddings,
                 dense_embeddings,
@@ -321,7 +407,7 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
             )
             sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
             low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
-                image_embeddings=image_embeddings,
+                image_embeddings=image_embeddings_i,
                 image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
@@ -393,6 +479,85 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
         mask_loss = mask_bce_loss + mask_dice_loss
 
         loss += mask_loss
+        loc_loss = torch.zeros_like(loss)
+        loc_frame_loss = torch.zeros_like(loss)
+        loc_global_loss = torch.zeros_like(loss)
+        if (
+            self.use_loc_token
+            and loc_token_mask is not None
+            and loc_targets_list is not None
+            and (
+                hasattr(self.model, "loc_temporal_head")
+                or hasattr(self.model, "loc_global_temporal_head")
+            )
+        ):
+            loc_last_hidden_state = output_hidden_states[-1]
+            if loc_token_mask.size(1) < loc_last_hidden_state.size(1):
+                pad = torch.zeros(
+                    (
+                        loc_token_mask.size(0),
+                        loc_last_hidden_state.size(1) - loc_token_mask.size(1),
+                    ),
+                    dtype=torch.bool,
+                    device=loc_token_mask.device,
+                )
+                loc_token_mask = torch.cat([loc_token_mask, pad], dim=1)
+            elif loc_token_mask.size(1) > loc_last_hidden_state.size(1):
+                loc_token_mask = loc_token_mask[:, : loc_last_hidden_state.size(1)]
+
+            loc_hidden_states = loc_last_hidden_state[loc_token_mask]
+            expected_loc_tokens = bK_size * t_size
+            if loc_hidden_states.shape[0] >= expected_loc_tokens:
+                loc_hidden_states = loc_hidden_states[:expected_loc_tokens].view(
+                    bK_size, t_size, -1
+                )
+                loc_targets = []
+                for batch_idx in range(len(offset) - 1):
+                    num_expr = int((offset[batch_idx + 1] - offset[batch_idx]).item())
+                    target_device = loc_hidden_states.device
+                    target_dtype = loc_hidden_states.dtype
+                    loc_target = loc_targets_list[batch_idx].to(
+                        device=target_device, dtype=target_dtype
+                    )
+                    if loc_target.numel() < t_size:
+                        loc_target = F.pad(loc_target, (0, t_size - loc_target.numel()))
+                    elif loc_target.numel() > t_size:
+                        loc_target = loc_target[:t_size]
+                    loc_targets.append(loc_target.unsqueeze(0).expand(num_expr, -1))
+                loc_targets = torch.cat(loc_targets, dim=0)
+                if (
+                    self.loc_mode == "frame"
+                    and hasattr(self.model, "loc_temporal_head")
+                    and self.loc_loss_weight > 0
+                ):
+                    loc_logits = self.model.loc_temporal_head(loc_hidden_states).squeeze(-1)
+                    loc_frame_loss = F.binary_cross_entropy_with_logits(
+                        loc_logits, loc_targets, reduction="mean"
+                    )
+                    loc_frame_loss = loc_frame_loss * self.loc_loss_weight
+
+                if (
+                    self.loc_mode == "global"
+                    and hasattr(self.model, "loc_global_context_proj")
+                    and hasattr(self.model, "loc_global_temporal_head")
+                    and self.global_loc_loss_weight > 0
+                ):
+                    global_context = self.model.loc_global_context_proj(
+                        loc_hidden_states.mean(dim=1, keepdim=True)
+                    ).expand(-1, t_size, -1)
+                    global_loc_input = torch.cat(
+                        [loc_hidden_states, global_context], dim=-1
+                    )
+                    global_loc_logits = self.model.loc_global_temporal_head(
+                        global_loc_input
+                    ).squeeze(-1)
+                    loc_global_loss = F.binary_cross_entropy_with_logits(
+                        global_loc_logits, loc_targets, reduction="mean"
+                    )
+                    loc_global_loss = loc_global_loss * self.global_loc_loss_weight
+
+                loc_loss = loc_frame_loss + loc_global_loss
+                loss += loc_loss
 
         return {
             "loss": loss,
@@ -400,6 +565,9 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
             "mask_bce_loss": mask_bce_loss,
             "mask_dice_loss": mask_dice_loss,
             "mask_loss": mask_loss,
+            "loc_loss": loc_loss,
+            "loc_frame_loss": loc_frame_loss,
+            "loc_global_loss": loc_global_loss,
             "raw_frames": images[0],
             "pred_masks": pred_masks[0],
             "gt_masks": gt_masks[0],
@@ -415,77 +583,238 @@ class MoRAForCausalLM(LlavaLlamaForCausalLM):
         original_size_list,
         max_new_tokens=32,
         tokenizer=None,
+        force_seg_token=False,
+        force_loc_token=False,
+        return_loc=False,
     ):
         with torch.no_grad():
+            if images.dim() == 5:
+                batch_size, t_size = images.shape[:2]
+                frame_images = images.reshape(
+                    -1, images.size(-3), images.size(-2), images.size(-1)
+                )
+            else:
+                batch_size, t_size = input_ids.size(0), images.size(0)
+                frame_images = images
+
+            if images_clip.dim() == 5:
+                gen_images_clip = images_clip[:, 0]
+                frame_images_clip = images_clip.reshape(
+                    -1,
+                    images_clip.size(-3),
+                    images_clip.size(-2),
+                    images_clip.size(-1),
+                )
+            else:
+                gen_images_clip = images_clip
+                frame_images_clip = images_clip
+
             outputs = self.generate(
-                images=images_clip,
+                images=gen_images_clip,
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 num_beams=1,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
             )
-            output_hidden_states = outputs.hidden_states[-1]  
             output_ids = outputs.sequences
 
-            seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
+            if force_seg_token:
+                has_seg = (output_ids == self.seg_token_idx).any(dim=1)
+                if not has_seg.all():
+                    seg_ids = torch.full(
+                        (output_ids.shape[0], 1),
+                        self.seg_token_idx,
+                        dtype=output_ids.dtype,
+                        device=output_ids.device,
+                    )
+                    output_ids = torch.cat([output_ids, seg_ids], dim=1)
+            if (
+                force_loc_token
+                and self.use_loc_token
+                and self.loc_token_idx is not None
+            ):
+                has_loc = (output_ids == self.loc_token_idx).any(dim=1)
+                if not has_loc.all():
+                    loc_ids = torch.full(
+                        (output_ids.shape[0], 1),
+                        self.loc_token_idx,
+                        dtype=output_ids.dtype,
+                        device=output_ids.device,
+                    )
+                    output_ids = torch.cat([output_ids, loc_ids], dim=1)
+
+            frame_input_ids = output_ids.unsqueeze(1).repeat(1, t_size, 1)
+            frame_input_ids = frame_input_ids.reshape(-1, output_ids.size(-1))
+            frame_attention_masks = torch.ones_like(frame_input_ids, dtype=torch.bool)
+            frame_outputs = super().forward(
+                images=frame_images_clip,
+                attention_mask=frame_attention_masks,
+                input_ids=frame_input_ids,
+                output_hidden_states=True,
+            )
+            output_hidden_states = frame_outputs.hidden_states
+            if isinstance(output_hidden_states, (tuple, list)):
+                output_hidden_states = output_hidden_states[-1]
+
+            loc_probs = None
+            if return_loc and self.use_loc_token and self.loc_token_idx is not None:
+                loc_token_mask = frame_input_ids[:, 1:] == self.loc_token_idx
+                loc_token_mask = torch.cat(
+                    [
+                        loc_token_mask,
+                        torch.zeros(
+                            (loc_token_mask.shape[0], 1),
+                            dtype=torch.bool,
+                            device=loc_token_mask.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+                loc_token_mask = torch.cat(
+                    [
+                        torch.zeros(
+                            (loc_token_mask.shape[0], 255),
+                            dtype=torch.bool,
+                            device=loc_token_mask.device,
+                        ),
+                        loc_token_mask,
+                    ],
+                    dim=1,
+                )
+                if loc_token_mask.size(1) < output_hidden_states.size(1):
+                    pad = torch.zeros(
+                        (
+                            loc_token_mask.size(0),
+                            output_hidden_states.size(1) - loc_token_mask.size(1),
+                        ),
+                        dtype=torch.bool,
+                        device=loc_token_mask.device,
+                    )
+                    loc_token_mask = torch.cat([loc_token_mask, pad], dim=1)
+                elif loc_token_mask.size(1) > output_hidden_states.size(1):
+                    loc_token_mask = loc_token_mask[:, : output_hidden_states.size(1)]
+
+                loc_hidden_states = output_hidden_states[loc_token_mask]
+                expected_loc_tokens = batch_size * t_size
+                if loc_hidden_states.size(0) >= expected_loc_tokens:
+                    loc_hidden_states = loc_hidden_states[:expected_loc_tokens].view(
+                        batch_size, t_size, -1
+                    )
+                    if (
+                        self.loc_mode == "frame"
+                        and hasattr(self.model, "loc_temporal_head")
+                    ):
+                        loc_logits = self.model.loc_temporal_head(
+                            loc_hidden_states
+                        ).squeeze(-1)
+                        loc_probs = loc_logits.sigmoid()
+                    elif (
+                        self.loc_mode == "global"
+                        and hasattr(self.model, "loc_global_context_proj")
+                        and hasattr(self.model, "loc_global_temporal_head")
+                    ):
+                        global_context = self.model.loc_global_context_proj(
+                            loc_hidden_states.mean(dim=1, keepdim=True)
+                        ).expand(-1, t_size, -1)
+                        global_loc_input = torch.cat(
+                            [loc_hidden_states, global_context], dim=-1
+                        )
+                        loc_logits = self.model.loc_global_temporal_head(
+                            global_loc_input
+                        ).squeeze(-1)
+                        loc_probs = loc_logits.sigmoid()
+
+            seg_token_mask = frame_input_ids[:, 1:] == self.seg_token_idx
+            seg_token_mask = torch.cat(
+                [
+                    seg_token_mask,
+                    torch.zeros(
+                        (seg_token_mask.shape[0], 1),
+                        dtype=torch.bool,
+                        device=seg_token_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
             # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
             seg_token_mask = torch.cat(
                 [
-                    torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(),
+                    torch.zeros(
+                        (seg_token_mask.shape[0], 255),
+                        dtype=torch.bool,
+                        device=seg_token_mask.device,
+                    ),
                     seg_token_mask,
                 ],
                 dim=1,
             )
 
-            hidden_states = []
-
             assert len(self.model.text_hidden_fcs) == 1
-            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
+            last_hidden_state = self.model.text_hidden_fcs[0](output_hidden_states)
+            if seg_token_mask.size(1) < last_hidden_state.size(1):
+                pad = torch.zeros(
+                    (
+                        seg_token_mask.size(0),
+                        last_hidden_state.size(1) - seg_token_mask.size(1),
+                    ),
+                    dtype=torch.bool,
+                    device=seg_token_mask.device,
+                )
+                seg_token_mask = torch.cat([seg_token_mask, pad], dim=1)
+            elif seg_token_mask.size(1) > last_hidden_state.size(1):
+                seg_token_mask = seg_token_mask[:, : last_hidden_state.size(1)]
 
-            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1) # should be at [-40, 40]
-            pred_embeddings = last_hidden_state[seg_token_mask]  # should be at [-10, 10]
-
-            seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-            seg_token_offset = seg_token_counts.cumsum(-1)
-            seg_token_offset = torch.cat(
-                [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+            pred_embeddings = last_hidden_state[seg_token_mask]
+            expected_prompts = batch_size * t_size
+            if pred_embeddings.size(0) < expected_prompts:
+                if return_loc:
+                    return output_ids, [], loc_probs
+                return output_ids, []
+            pred_embeddings = pred_embeddings[:expected_prompts].reshape(
+                batch_size, t_size, -1
             )
 
-            pred_embeddings_ = []
-            for i in range(len(seg_token_offset) - 1):
-                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-                pred_embeddings_.append(pred_embeddings[start_i:end_i])
-            pred_embeddings = pred_embeddings_
-
-            image_embeddings = self.get_visual_embs(images)
+            image_embeddings = self.get_visual_embs(frame_images)
 
             multimask_output = False
             pred_masks = []
-            for i in range(len(pred_embeddings)):
-                (
-                    sparse_embeddings,
-                    dense_embeddings,
-                ) = self.model.visual_model.prompt_encoder(
-                    points=None,
-                    boxes=None,
-                    masks=None,
-                    text_embeds=pred_embeddings[i].unsqueeze(1),
-                )
+            for i in range(batch_size):
+                for t in range(t_size):
+                    frame_idx = i * t_size + t
+                    frame_pred_embedding = pred_embeddings[i, t].view(1, 1, -1)
+                    (
+                        sparse_embeddings,
+                        dense_embeddings,
+                    ) = self.model.visual_model.prompt_encoder(
+                        points=None,
+                        boxes=None,
+                        masks=None,
+                        text_embeds=frame_pred_embedding,
+                    )
 
-                sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-                low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
-                    image_embeddings=image_embeddings[i].unsqueeze(0),
-                    image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,  
-                    multimask_output=multimask_output,
-                )
-                pred_mask = self.model.visual_model.postprocess_masks(
-                    low_res_masks,
-                    input_size=resize_list[i],
-                    original_size=original_size_list[i],
-                )
-                pred_masks.append(pred_mask[:, 0])
+                    sparse_embeddings = sparse_embeddings.to(frame_pred_embedding.dtype)
+                    low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                        image_embeddings=image_embeddings[frame_idx].unsqueeze(0),
+                        image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                        sparse_prompt_embeddings=sparse_embeddings,
+                        dense_prompt_embeddings=dense_embeddings,
+                        multimask_output=multimask_output,
+                    )
+                    pred_mask = self.model.visual_model.postprocess_masks(
+                        low_res_masks,
+                        input_size=resize_list[min(frame_idx, len(resize_list) - 1)],
+                        original_size=original_size_list[
+                            min(frame_idx, len(original_size_list) - 1)
+                        ],
+                    )
+                    pred_masks.append(pred_mask[:, 0])
 
+        if return_loc:
+            return output_ids, pred_masks, loc_probs
         return output_ids, pred_masks
+
+
+# Backward-compatible names used by older scripts/checkpoints.
+VideoLISAForCausalLM = MoRAForCausalLM
+PooledVideoLISAForCausalLM = MoRAForCausalLM

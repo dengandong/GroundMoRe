@@ -14,7 +14,6 @@ from .transforms_video import Compose, Check, ToTensor, Normalize, RandomHorizon
 from transformers import CLIPImageProcessor
 
 
-from model.llava import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
 
@@ -27,7 +26,7 @@ import random
 import cv2
 
 from .categories import ytvos_category_dict as category_dict
-from .utils import ANSWER_LIST, SHORT_QUESTION_LIST
+from .utils import ANSWER_LIST, ANSWER_LIST_WITH_LOC, SHORT_QUESTION_LIST
 
 
 class YTVOSDataset(Dataset):
@@ -57,7 +56,9 @@ class YTVOSDataset(Dataset):
                  return_masks: bool, 
                  num_frames: int, 
                  max_skip: int,
-                 image_size: int = 1024):
+                 image_size: int = 1024,
+                 use_loc_token: bool = True,
+                 return_qwen_images: bool = False):
         
         self.img_folder = img_folder     
         self.ann_file = ann_file         
@@ -66,9 +67,10 @@ class YTVOSDataset(Dataset):
         self.max_skip = max_skip
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        self.return_qwen_images = return_qwen_images
 
         self.short_question_list = SHORT_QUESTION_LIST
-        self.answer_list = ANSWER_LIST
+        self.answer_list = ANSWER_LIST_WITH_LOC if use_loc_token else ANSWER_LIST
 
         # create video meta data
         self.prepare_metas()       
@@ -218,7 +220,7 @@ class YTVOSDataset(Dataset):
             sample_indx.sort()
 
             # read frames and masks
-            imgs, labels, boxes, masks, valid, img_clips = [], [], [], [], [], []
+            imgs, labels, boxes, masks, valid, img_clips, qwen_images = [], [], [], [], [], [], []
             random_id = int(torch.randint(low=0, high=10000, size=(1,))[0])
             for j in range(self.num_frames):
                 frame_indx = sample_indx[j]
@@ -227,6 +229,8 @@ class YTVOSDataset(Dataset):
                 mask_path = os.path.join(str(self.img_folder), 'Annotations', video, frame_name + '.png')
                 img = Image.open(img_path).convert('RGB')
                 mask = Image.open(mask_path).convert('P')
+                if self.return_qwen_images:
+                    qwen_images.append(img.copy())
 
                 # preprocess image for clip
                 image_clip = self.clip_image_processor.preprocess(img, return_tensors="pt")[
@@ -285,7 +289,10 @@ class YTVOSDataset(Dataset):
             else:
                 idx = random.randint(0, self.__len__() - 1)
 
-            sampled_classes = exps  # ?? is it?
+            # Masks are stored per object, while Refer-Youtube-VOS can provide
+            # multiple expressions for the same object. Train one expression per
+            # sample so the model predicts one temporal mask sequence [T, H, W].
+            sampled_classes = [random.choice(exps)]
 
             questions = []
             answers = []
@@ -297,27 +304,31 @@ class YTVOSDataset(Dataset):
                 answers.append(random.choice(self.answer_list))
 
             conversations = []
-            conv = conversation_lib.default_conversation.copy()
+            if not self.return_qwen_images:
+                from model.llava import conversation as conversation_lib
 
-            i = 0
-            while i < len(questions):
-                conv.messages = []
-                conv.append_message(conv.roles[0], questions[i])
-                conv.append_message(conv.roles[1], answers[i])
-                conversations.append(conv.get_prompt())
-                i += 1
+                conv = conversation_lib.default_conversation.copy()
+                i = 0
+                while i < len(questions):
+                    conv.messages = []
+                    conv.append_message(conv.roles[0], questions[i])
+                    conv.append_message(conv.roles[1], answers[i])
+                    conversations.append(conv.get_prompt())
+                    i += 1
 
-        return (imgs, 
-                img_clips,
-                conversations,  # only one for each video?
-                masks,
-                size_label,
-                resize,
-                questions,
-                sampled_classes,
-                video,
-                exp_id
-                )
+        output = (imgs,
+                  img_clips,
+                  conversations,  # only one for each video?
+                  masks,
+                  size_label,
+                  resize,
+                  questions,
+                  sampled_classes,
+                  video,
+                  exp_id)
+        if self.return_qwen_images:
+            output = output + (qwen_images,)
+        return output
 
 
 class YTVOSValDataset(Dataset):
@@ -344,7 +355,8 @@ class YTVOSValDataset(Dataset):
                  ann_file: Path, 
                  tokenizer,
                  vision_tower,
-                 image_size: int = 1024):
+                 image_size: int = 1024,
+                 use_loc_token: bool = True):
         
         self.img_folder = img_folder     
         self.ann_file = ann_file         
@@ -352,7 +364,7 @@ class YTVOSValDataset(Dataset):
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
 
         self.short_question_list = SHORT_QUESTION_LIST
-        self.answer_list = ANSWER_LIST
+        self.answer_list = ANSWER_LIST_WITH_LOC if use_loc_token else ANSWER_LIST
 
         # create video meta data
         self.prepare_metas()       
@@ -488,15 +500,17 @@ class YTVOSValDataset(Dataset):
             answers.append(random.choice(self.answer_list))
 
         conversations = []
-        conv = conversation_lib.default_conversation.copy()
+        if not self.return_qwen_images:
+            from model.llava import conversation as conversation_lib
 
-        i = 0
-        while i < len(questions):
-            conv.messages = []
-            conv.append_message(conv.roles[0], questions[i])
-            conv.append_message(conv.roles[1], answers[i])
-            conversations.append(conv.get_prompt())
-            i += 1
+            conv = conversation_lib.default_conversation.copy()
+            i = 0
+            while i < len(questions):
+                conv.messages = []
+                conv.append_message(conv.roles[0], questions[i])
+                conv.append_message(conv.roles[1], answers[i])
+                conversations.append(conv.get_prompt())
+                i += 1
         inference = False
         
         return (imgs, 

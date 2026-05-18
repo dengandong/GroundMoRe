@@ -41,6 +41,14 @@ ANSWER_LIST = [
     "[SEG].",
 ]
 
+ANSWER_LIST_WITH_LOC = [
+    "It is [SEG], and the temporal boundary is [LOC].",
+    "Sure, [SEG], and [LOC].",
+    "Sure, it is [SEG], and the temporal boundary is [LOC].",
+    "Sure, the segmentation result is [SEG], and the temporal boundary is [LOC].",
+    "[SEG], [LOC].",
+]
+
 
 class Summary(Enum):
     NONE = 0

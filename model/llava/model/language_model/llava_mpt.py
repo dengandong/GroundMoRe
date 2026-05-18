@@ -170,5 +170,5 @@ class LlavaMPTForCausalLM(MPTForCausalLM, LlavaMetaForCausalLM):
         }
 
 
-AutoConfig.register("llava_mpt", LlavaMPTConfig)
-AutoModelForCausalLM.register(LlavaMPTConfig, LlavaMPTForCausalLM)
+AutoConfig.register("llava_mpt", LlavaMPTConfig, exist_ok=True)
+AutoModelForCausalLM.register(LlavaMPTConfig, LlavaMPTForCausalLM, exist_ok=True)

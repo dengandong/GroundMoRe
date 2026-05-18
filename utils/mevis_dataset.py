@@ -6,20 +6,22 @@
 """
 MeViS data loader
 """
-from pathlib import Path
-
 import torch
-# from torch.autograd.grad_mode import F
+import torch.nn.functional as F
 from torch.utils.data import Dataset
-
 import os
 from PIL import Image
 import json
 import numpy as np
 import random
 
+from transformers import CLIPImageProcessor
 
 from pycocotools import mask as coco_mask
+
+from model.segment_anything.utils.transforms import ResizeLongestSide
+
+from .utils import ANSWER_LIST, ANSWER_LIST_WITH_LOC, SHORT_QUESTION_LIST
 
 
 class MeViSDataset(Dataset):
@@ -28,19 +30,42 @@ class MeViSDataset(Dataset):
     "MeViS: A Large-scale Benchmark for Video Segmentation with Motion Expressions"
     """
 
-    def __init__(self, img_folder: Path, ann_file: Path, transforms, return_masks: bool,
-                 num_frames: int, max_skip: int):
+    pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+    pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+    img_size = 1024
+
+    def __init__(
+        self,
+        img_folder,
+        ann_file,
+        tokenizer=None,
+        vision_tower=None,
+        transforms=None,
+        return_masks: bool = False,
+        num_frames: int = 5,
+        max_skip: int = 3,
+        image_size: int = 1024,
+        use_loc_token: bool = True,
+        return_qwen_images: bool = False,
+    ):
         self.img_folder = img_folder
         self.ann_file = ann_file
         self._transforms = transforms
         self.return_masks = return_masks  # not used
         self.num_frames = num_frames
         self.max_skip = max_skip
+        self.img_size = image_size
+        self.transform = ResizeLongestSide(image_size)
+        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        self.return_qwen_images = return_qwen_images
+        self.short_question_list = SHORT_QUESTION_LIST
+        self.answer_list = ANSWER_LIST_WITH_LOC if use_loc_token else ANSWER_LIST
+
         # create video meta data
         self.prepare_metas()
 
-        mask_json = os.path.join(str(self.img_folder) + '/mask_dict.json')
-        print(f'Loading masks form {mask_json} ...')
+        mask_json = os.path.join(str(self.img_folder), "mask_dict.json")
+        print(f'Loading masks from {mask_json} ...')
         with open(mask_json) as fp:
             self.mask_dict = json.load(fp)
 
@@ -70,6 +95,7 @@ class MeViSDataset(Dataset):
                     meta['frames'] = vid_frames
                     meta['frame_id'] = frame_id
                     meta['category'] = 0
+                    meta['exp_id'] = exp_id
                     self.metas.append(meta)
 
     @staticmethod
@@ -83,13 +109,22 @@ class MeViSDataset(Dataset):
     def __len__(self):
         return len(self.metas)
 
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize pixel values and pad to a square SAM input."""
+        x = (x - self.pixel_mean) / self.pixel_std
+        h, w = x.shape[-2:]
+        padh = self.img_size - h
+        padw = self.img_size - w
+        return F.pad(x, (0, padw, 0, padh))
+
     def __getitem__(self, idx):
         instance_check = False
+        idx = random.randint(0, len(self.metas) - 1)
         while not instance_check:
             meta = self.metas[idx]  # dict
 
-            video, exp, anno_id, category, frames, frame_id = \
-                meta['video'], meta['exp'], meta['anno_id'], meta['category'], meta['frames'], meta['frame_id']
+            video, exp, anno_id, category, frames, frame_id, exp_id = \
+                meta['video'], meta['exp'], meta['anno_id'], meta['category'], meta['frames'], meta['frame_id'], meta['exp_id']
             # clean up the caption
             exp = " ".join(exp.lower().split())
             category_id = 0
@@ -125,13 +160,19 @@ class MeViSDataset(Dataset):
             sample_indx.sort()
 
             # read frames and masks
-            imgs, labels, boxes, masks, valid = [], [], [], [], []
+            imgs, labels, boxes, masks, valid, img_clips, qwen_images = [], [], [], [], [], [], []
             for j in range(self.num_frames):
                 frame_indx = sample_indx[j]
                 frame_name = frames[frame_indx]
                 img_path = os.path.join(str(self.img_folder), 'JPEGImages', video, frame_name + '.jpg')
                 # mask_path = os.path.join(str(self.img_folder), 'Annotations', video, frame_name + '.png')
                 img = Image.open(img_path).convert('RGB')
+                if self.return_qwen_images:
+                    qwen_images.append(img.copy())
+                image_clip = self.clip_image_processor.preprocess(img, return_tensors="pt")[
+                    "pixel_values"
+                ][0]
+
                 # h, w = img.shape
                 mask = np.zeros(img.size[::-1], dtype=np.float32)
                 for x in anno_id:
@@ -152,32 +193,29 @@ class MeViSDataset(Dataset):
                 mask = torch.from_numpy(mask)
 
                 # append
+                img = np.array(img)
+                img = self.transform.apply_image(img)
+                resize = img.shape[:2]
+                img = self.preprocess(torch.from_numpy(img).permute(2, 0, 1).contiguous())
+
                 imgs.append(img)
                 labels.append(label)
                 masks.append(mask)
                 boxes.append(box)
+                img_clips.append(image_clip)
 
             # transform
-            w, h = img.size
-            labels = torch.stack(labels, dim=0)
-            boxes = torch.stack(boxes, dim=0)
-            boxes[:, 0::2].clamp_(min=0, max=w)
-            boxes[:, 1::2].clamp_(min=0, max=h)
             masks = torch.stack(masks, dim=0)
             target = {
                 'frames_idx': torch.tensor(sample_indx),  # [T,]
-                'labels': labels,  # [T,]
-                'boxes': boxes,  # [T, 4], xyxy
                 'masks': masks,  # [T, H, W]
                 'valid': torch.tensor(valid),  # [T,]
                 'caption': exp,
-                'orig_size': torch.as_tensor([int(h), int(w)]),
-                'size': torch.as_tensor([int(h), int(w)])
             }
+            size_label = torch.ones(masks.size(1), masks.size(2)) * 255
 
-            # "boxes" normalize to [0, 1] and transform from xyxy to cxcywh in self._transform
-            imgs, target = self._transforms(imgs, target)
             imgs = torch.stack(imgs, dim=0)  # [T, 3, H, W]
+            img_clips = torch.stack(img_clips, dim=0)
 
             # FIXME: handle "valid", since some box may be removed due to random crop
             if torch.any(target['valid'] == 1):  # at leatst one instance
@@ -185,4 +223,38 @@ class MeViSDataset(Dataset):
             else:
                 idx = random.randint(0, self.__len__() - 1)
 
-        return imgs, target
+        sampled_classes = [exp]
+        questions = []
+        answers = []
+        for text in sampled_classes:
+            text = text.strip()
+            question_template = random.choice(self.short_question_list)
+            questions.append(question_template.format(class_name=text.lower()))
+            answers.append(random.choice(self.answer_list))
+
+        conversations = []
+        if not self.return_qwen_images:
+            from model.llava import conversation as conversation_lib
+
+            conv = conversation_lib.default_conversation.copy()
+            for question, answer in zip(questions, answers):
+                conv.messages = []
+                conv.append_message(conv.roles[0], question)
+                conv.append_message(conv.roles[1], answer)
+                conversations.append(conv.get_prompt())
+
+        output = (
+            imgs,
+            img_clips,
+            conversations,
+            masks,
+            size_label,
+            resize,
+            questions,
+            sampled_classes,
+            video,
+            exp_id,
+        )
+        if self.return_qwen_images:
+            output = output + (qwen_images,)
+        return output
