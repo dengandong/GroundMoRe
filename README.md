@@ -222,10 +222,11 @@ Download the released Qwen-based MoRA checkpoint shards:
 
 ```bash
 huggingface-cli download groundmore/mora-ft-qwen3-vl-8b \
+  --include "pytorch_model*.bin" "pytorch_model.bin.index.json" \
   --local-dir checkpoints/mora-ft-qwen3-vl-8b
 ```
 
-The LISA release is saved in Hugging Face `save_pretrained` format. The Qwen release stores sharded PyTorch checkpoint weights and should be passed as the checkpoint weight directory for Qwen evaluation.
+The LISA release is saved in Hugging Face `save_pretrained` format. The Qwen release stores sharded PyTorch checkpoint weights and should be passed as the checkpoint weight directory for Qwen evaluation. The Qwen evaluation script reads `pytorch_model.bin.index.json` and the `pytorch_model-*.bin` shards.
 
 ### LISA-Based Training Pipeline
 
